@@ -7,7 +7,7 @@ ENV UV_LINK_MODE=copy \
 ADD . /app
 WORKDIR /app
 
-RUN uv sync --no-cache --link-mode copy
+RUN uv sync --no-cache --locked --link-mode copy
 
 ENV PRODUCTION_MODE=True \
     PATH="/app/.venv/bin:$PATH" \

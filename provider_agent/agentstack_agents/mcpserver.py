@@ -1,32 +1,30 @@
-"""
-MCP Server — exposes a list_doctors() tool via FastMCP (stdio transport).
-doctors.json must be in the same directory as this file.
-
-Before building:
-  Copy ../../Data/doctors.json → provider_agent/agentstack_agents/doctors.json
-"""
 import json
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+# Initialize the server
 mcp = FastMCP("doctorserver")
 
-_data_path = Path(__file__).parent / "doctors.json"
-doctors: list = json.loads(_data_path.read_text())
+# Load Data
+data_path = Path(__file__).resolve().parent / "doctors.json"
+doctors: list = json.loads(data_path.read_text())
 
 
 @mcp.tool()
 def list_doctors(state: str | None = None, city: str | None = None) -> list[dict]:
-    """Returns doctors practicing in a specific location. Search is case-insensitive.
+    """This tool returns a list of doctors practicing in a specific location. The search is case-insensitive.
 
     Args:
-        state: Two-letter state code (e.g. "CA", "TX").
-        city:  City name (e.g. "Austin", "Boston").
+        state: The two-letter state code (e.g., "CA" for California).
+        city: The name of the city or town (e.g., "Boston").
 
     Returns:
-        List of doctor records matching the criteria.
+        A JSON string representing a list of doctors matching the criteria.
+        If no criteria are provided, an error message is returned.
+        Example: '[{"name": "Dr John James", "specialty": "Cardiology", ...}]'
     """
+    # Input validation: ensure at least one search term is given.
     if not state and not city:
         return [{"error": "Please provide a state or a city."}]
 
@@ -41,5 +39,6 @@ def list_doctors(state: str | None = None, city: str | None = None) -> list[dict
     ]
 
 
+# Kick off server if file is run
 if __name__ == "__main__":
     mcp.run(transport="stdio")
