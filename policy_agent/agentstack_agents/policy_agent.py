@@ -1,145 +1,69 @@
-import asyncio
+import base64
 import os
 from pathlib import Path
-from typing import Annotated, Optional
 
 from a2a.types import Message
 from a2a.utils.message import get_message_text
-from agentstack_sdk.a2a.extensions import LLMServiceExtensionServer, LLMServiceExtensionSpec
 from agentstack_sdk.a2a.types import AgentMessage
 from agentstack_sdk.server import Server
 from agentstack_sdk.server.context import RunContext
-from beeai_framework.adapters.openai import OpenAIChatModel
-from beeai_framework.backend import ChatModelParameters
-from beeai_framework.backend.message import SystemMessage, UserMessage
-from PyPDF2 import PdfReader
-
-
-class PolicyAgent:
-    """
-    A policy agent that reads a benefits PDF and answers coverage questions.
-    """
-
-    def __init__(
-        self,
-        pdf_path: Optional[str] = None,
-        system_prompt: str = (
-            "You are an expert insurance agent designed to assist with coverage queries. "
-            "Use the provided documents to answer questions about insurance policies. "
-            "If the information is not available in the documents, respond with \"I don't know\"."
-        ),
-    ) -> None:
-        # Configure prompts and load the policy document for reference
-        self.system_prompt = system_prompt
-
-        self.pdf_path = Path(pdf_path) if pdf_path else Path(__file__).resolve().parent / "2026AnthemgHIPSBC.pdf"
-        self.pdf_bytes = self._load_pdf(self.pdf_path)
-        self.pdf_text = self._extract_pdf_text(self.pdf_path)
-
-    @staticmethod
-    def _load_pdf(path: Path) -> bytes:
-        # Read the PDF file as raw bytes for tools that might need it
-        if not path.exists():
-            raise FileNotFoundError(f"PDF not found at {path.resolve()}")
-        return path.read_bytes()
-
-    @staticmethod
-    def _extract_pdf_text(path: Path) -> str:
-        """
-        Extract text content from the PDF so the LLM can read it.
-        Falls back to an empty string if extraction fails.
-        """
-        reader = PdfReader(str(path))
-        pages = []
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                pages.append(text)
-        return "\n\n".join(pages)
-
-    def build_prompt(self, prompt: str) -> str:
-        # Build a single prompt with policy text plus the user’s question
-        return (
-            f"{self.system_prompt}\n\n"
-            "Reference policy document text below. Use it to answer the question. "
-            "If the details are not present, reply with \"I don't know\".\n"
-            f"Policy text:\n{self.pdf_text}\n\n"
-            f"User question: {prompt}"
-        )
-
-    async def answer_query(self, prompt: str, llm_config) -> str:
-        """
-        Send the user prompt plus embedded PDF to the LLM provided by the platform extension.
-        """
-        if not llm_config or not llm_config.api_key:
-            return "LLM service not available. Please enable the LLM extension for this agent."
-
-        # Create the model client from the platform-provided config
-        llm_client = OpenAIChatModel(
-            model_id=llm_config.api_model,
-            base_url=llm_config.api_base,
-            api_key=llm_config.api_key,
-            parameters=ChatModelParameters(temperature=0, stream=False),
-            tool_choice_support={"auto", "required"},
-        )
-
-        # Ask the LLM with system prompt, policy text, and user question
-        response = await llm_client.run(
-            [
-                SystemMessage(self.system_prompt),
-                SystemMessage(
-                    "Policy document text to consult when answering:\n"
-                    f"{self.pdf_text}"
-                ),
-                UserMessage(prompt),
-            ],
-        )
-
-        text = response.get_text_content() if hasattr(response, "get_text_content") else None
-        return text or "I don't know"
-
-# Create the server and policy agent instance from the class
-server = Server()
-policy_agent = PolicyAgent()
-
-# Provide the server with an Agent name so it can be discovered on the Agent Stack Platform by name and called by the Healthcare agent as a handoff tool
-@server.agent(
-    name="PolicyAgent",
+from anthropic import Anthropic
+from anthropic.types import (
+    Base64PDFSourceParam,
+    DocumentBlockParam,
+    MessageParam,
+    TextBlockParam,
 )
-async def policy_agent_wraper(
-    input: Message,
-    context: RunContext,
-    llm: Annotated[
-        LLMServiceExtensionServer,
-        LLMServiceExtensionSpec.single_demand(suggested=("gemini:gemini-2.5-flash-lite",)),
-    ],
-):
-    """Wrapper around the policy agent using the AgentStack LLM extension."""
-    # Pull the raw user message text
+from dotenv import load_dotenv
+
+load_dotenv()
+
+server = Server()
+
+_PDF_PATH = Path(__file__).resolve().parent / "2026AnthemgHIPSBC.pdf"
+_pdf_data = base64.standard_b64encode(_PDF_PATH.read_bytes()).decode("utf-8")
+
+
+@server.agent(name="PolicyAgent")
+async def policy_agent(input: Message, context: RunContext):
+    """Insurance policy coverage agent — reads the Anthem 2026 PDF and answers questions."""
     prompt = get_message_text(input)
-    llm_config = None
 
-    # Get the default LLM fulfillment from the extension
-    if llm and llm.data and llm.data.llm_fulfillments:
-        llm_config = llm.data.llm_fulfillments.get("default")
-    else:
-        yield AgentMessage(text="LLM selection is required.")
-        return
+    client = Anthropic()
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        system=(
+            "You are an expert insurance agent. Answer questions about insurance policies "
+            "using the provided documents. Keep answers to 2-5 lines. "
+            "If the information is not available, respond with 'I don't know'."
+        ),
+        messages=[
+            MessageParam(
+                role="user",
+                content=[
+                    DocumentBlockParam(
+                        type="document",
+                        source=Base64PDFSourceParam(
+                            type="base64",
+                            media_type="application/pdf",
+                            data=_pdf_data,
+                        ),
+                    ),
+                    TextBlockParam(type="text", text=prompt),
+                ],
+            )
+        ],
+    )
 
-    # Validate we have an LLM config
-    if not llm_config:
-        yield AgentMessage(text="No LLM configuration available from the extension.")
-        return
+    yield AgentMessage(text=response.content[0].text)
 
-    # Delegate to the policy agent and stream the answer
-    response = await policy_agent.answer_query(prompt, llm_config)
-    yield AgentMessage(text=response)
 
-# Run the server with 
 def run() -> None:
-    host = os.getenv("HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", 8000))
-    server.run(host=host, port=port)
+    server.run(
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", 8000)),
+    )
 
 
 if __name__ == "__main__":

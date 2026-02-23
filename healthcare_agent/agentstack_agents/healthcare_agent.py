@@ -1,232 +1,103 @@
-import json
+import asyncio
 import os
-from typing import Annotated
+import uuid
 
-from a2a.types import Message, Role
+import httpx
+from a2a.types import Message
 from a2a.utils.message import get_message_text
 from agentstack_sdk.a2a.types import AgentMessage
 from agentstack_sdk.server import Server
 from agentstack_sdk.server.context import RunContext
+from anthropic import Anthropic
+from dotenv import load_dotenv
 
-from agentstack_sdk.a2a.extensions import (
-    AgentDetail,
-    AgentDetailContributor,
-    AgentDetailTool,
-    LLMServiceExtensionServer,
-    LLMServiceExtensionSpec,
-    TrajectoryExtensionServer,
-    TrajectoryExtensionSpec,
-)
-from beeai_framework.adapters.openai import OpenAIChatModel
-from beeai_framework.agents.requirement import RequirementAgent
-from beeai_framework.agents.requirement.requirements.conditional import ConditionalRequirement
-from beeai_framework.agents.types import AgentExecutionConfig
-from beeai_framework.backend import ChatModelParameters
-from beeai_framework.backend.message import AssistantMessage, UserMessage
-from beeai_framework.memory import UnconstrainedMemory
-from beeai_framework.tools.think import ThinkTool
-from beeai_framework.tools.handoff import HandoffTool
-from beeai_framework.adapters.agentstack.agents import AgentStackAgent
-from beeai_framework.adapters.agentstack.agents.types import AgentStackAgentStatus
-
+load_dotenv()
 
 server = Server()
-memories: dict[str, UnconstrainedMemory] = {}
 
 
-def get_memory(context: RunContext) -> UnconstrainedMemory:
-    # Keep a per-session memory object so the conversation stays stateful
-    """Get or create session memory keyed by context id."""
-    context_id = getattr(context, "context_id", getattr(context, "session_id", "default"))
-    if context_id not in memories:
-        memories[context_id] = UnconstrainedMemory()
-    return memories[context_id]
+async def _call_agent(url: str, query: str) -> str:
+    """Call a deployed AgentStack A2A agent via JSON-RPC and return its text response."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "message/send",
+        "params": {
+            "message": {
+                "messageId": str(uuid.uuid4()),
+                "role": "user",
+                "parts": [{"kind": "text", "text": query}],
+            }
+        },
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(f"{url.rstrip('/')}/jsonrpc/", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    result = data.get("result", {})
+    # AgentStack history format
+    for msg in reversed(result.get("history", [])):
+        if msg.get("role") == "agent":
+            for part in msg.get("parts", []):
+                if part.get("kind") == "text":
+                    return part["text"]
+    # Fallback: artifacts format (standard A2A)
+    for artifact in result.get("artifacts", []):
+        for part in artifact.get("parts", []):
+            if part.get("kind") == "text":
+                return part["text"]
+    return "(no response)"
 
 
-def to_framework_message(message: Message):
-    # Normalize A2A messages into BeeAI message types
-    """Convert A2A Message to BeeAI Framework Message format."""
-    message_text = get_message_text(message)
-    if message.role == Role.agent:
-        return AssistantMessage(message_text)
-    return UserMessage(message_text)
-
-
-def summarize_for_trajectory(data: object, limit: int = 400) -> str:
+@server.agent(name="HealthcareAgent")
+async def healthcare_agent(input: Message, context: RunContext):
     """
-    Convert tool inputs/outputs to a readable, bounded string for trajectory updates.
+    Healthcare concierge orchestrator — calls PolicyAgent and ProviderAgent in parallel,
+    then uses Claude to summarize both responses into a single answer.
+
+    Required env vars (set on AgentStack platform):
+      ANTHROPIC_API_KEY   — Anthropic API key
+      POLICY_AGENT_URL    — Deployed URL of PolicyAgent
+      PROVIDER_AGENT_URL  — Deployed URL of ProviderAgent
     """
-    try:
-        text = data if isinstance(data, str) else json.dumps(data, default=str)
-    except Exception:
-        text = str(data)
+    query = get_message_text(input)
 
-    return text if len(text) <= limit else f"{text[:limit]}... [truncated]"
+    policy_url = os.environ.get("POLICY_AGENT_URL", "http://localhost:8001")
+    provider_url = os.environ.get("PROVIDER_AGENT_URL", "http://localhost:8002")
 
+    # Call both sub-agents in parallel
+    policy_resp, provider_resp = await asyncio.gather(
+        _call_agent(policy_url, query),
+        _call_agent(provider_url, query),
+    )
 
-@server.agent(
-    name="Healthcare Concierge",
-    default_input_modes=["text", "text/plain"],
-    default_output_modes=["text", "text/plain"],
-    detail=AgentDetail(
-        interaction_mode="multi-turn",
-        user_greeting="Hi there! I can help navigate benefits, providers, and coverage details.",
-        input_placeholder="Ask a healthcare question...",
-        programming_language="Python",
-        framework="BeeAI",
-        contributors=[
-            AgentDetailContributor(
-                name="Sandi Besen and Ken Ocheltree",
-                email="name@example.com",
-            )
+    # Combine with a direct Anthropic call
+    anthropic = Anthropic()
+    result = anthropic.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=512,
+        system="Summarize responses from sub-agents into a clear answer. Cite each agent by name.",
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"User question: {query}\n\n"
+                    f"PolicyAgent: {policy_resp}\n\n"
+                    f"ProviderAgent: {provider_resp}"
+                ),
+            }
         ],
-        tools=[
-            AgentDetailTool(
-                name="Think",
-                description="Plans the best approach before responding.",
-            )
-        ],
-    ),
-)
-async def healthcare_concierge(
-    message: Message,
-    context: RunContext,
-    trajectory: Annotated[TrajectoryExtensionServer, TrajectoryExtensionSpec()],
-    llm: Annotated[
-        LLMServiceExtensionServer,
-        LLMServiceExtensionSpec.single_demand(suggested=("gemini:gemini-2.5-flash-lite",)),
-    ],
-):
-    """
-    Healthcare concierge agent that answers insurance and provider questions.
-    """
-
-    # Initial UI update to the trajecotry so users see the agent is starting
-    yield trajectory.trajectory_metadata(
-        title="Initializing Agent...",
-        content="Setting up your Healthcare Concierge.",
     )
 
-    # Attach existing session memory and backfill prior messages for multiturn conversations
-    memory = get_memory(context)
-
-    # Load existing history into BeeAI memory
-    history = [msg async for msg in context.load_history() if isinstance(msg, Message) and msg.parts]
-    await memory.add_many(to_framework_message(item) for item in history)
-
-    # Configure the LLM from extension fulfillment
-    if not llm or not llm.data:
-        yield trajectory.trajectory_metadata(title="LLM Error", content="LLM extension missing.")
-        yield "LLM selection is required."
-        return
-
-    llm_config = llm.data.llm_fulfillments.get("default")
-    if not llm_config:
-        yield trajectory.trajectory_metadata(title="LLM Error", content="No LLM fulfillment available.")
-        yield "No LLM configuration available from the extension."
-        return
+    yield AgentMessage(text=result.content[0].text)
 
 
-    llm_client = OpenAIChatModel(
-        model_id=llm_config.api_model,
-        base_url=llm_config.api_base,
-        api_key=llm_config.api_key,
-        parameters=ChatModelParameters(temperature=0, stream=True),
-        tool_choice_support={"auto", "required"},
-    )
-
-
-    # Make other AgentStack agents discoverable that have been deployed to the platform and make them available via handoff tools
-    agents = await AgentStackAgent.from_agent_stack()
-    handoff_agents = {a.name: a for a in agents if a.name in {"PolicyAgent", "ResearchAgent", "ProviderAgent"}}
-    print([a.name for a in agents])
-    policy_handoff = HandoffTool(handoff_agents["PolicyAgent"])
-    research_handoff = HandoffTool(handoff_agents["ResearchAgent"])
-    provider_handoff = HandoffTool(handoff_agents["ProviderAgent"])
-
-    think_tool=ThinkTool()
-
-    # High-level agent instruction for tone and routing behavior
-    instructions = (
-        "You are a friendly healthcare concierge. "
-        "Answer questions about plan coverage, in-network providers, and costs. "
-        "Hand off your task to the PolicyAgent when there are specific questions pertaining to the user's policy details."
-        "Hand off your task to the ResearchAgent when you need information about symptoms, health conditions, treatments, or procedures using up-to-date web resources."
-        "Hand off your task to the ProviderAgent when you need information about the providers in network."
-        "If unsure, ask clarifying questions before giving guidance."
-    )
-
-    #BeeAI Requirement agent with conditional requirements
-    agent = RequirementAgent(
-        llm=llm_client,
-        name="HealthcareConcierge",
-        memory=memory,
-        tools=[think_tool, policy_handoff, research_handoff, provider_handoff],
-        requirements=[ConditionalRequirement(think_tool, force_at_step=1),
-                      ConditionalRequirement(policy_handoff, min_invocations=1, max_invocations=1),
-                      ConditionalRequirement(research_handoff, min_invocations=1, max_invocations=1),
-                      ConditionalRequirement(provider_handoff, min_invocations=1, max_invocations=1),
-                      ],
-        role="Healthcare Concierge",
-        instructions=instructions,
-    )
-
-    user_prompt = get_message_text(message)
-
-    response_text = ""
-
-    def handle_final_answer_stream(data, meta) -> None:
-        nonlocal response_text
-        # Accumulate streamed final answer text
-        if getattr(data, "delta", None):
-            response_text += data.delta
-
-    # Run the agent loop and stream trajectory + final answer updates
-    async for event, meta in agent.run(
-        user_prompt,
-        execution=AgentExecutionConfig(max_iterations=20, max_retries_per_step=2),
-    ).on("final_answer", handle_final_answer_stream):
-        if meta.name == "final_answer":
-            if getattr(event, "delta", None):
-                yield event.delta
-            elif getattr(event, "text", None):
-                response_text += event.text
-        elif meta.name == "success" and event.state.steps:
-            step = event.state.steps[-1]
-            if step.tool and step.tool.name == "think":
-                thoughts = step.input.get("thoughts", "Planning response.")
-                yield trajectory.trajectory_metadata(title="Thinking", content=thoughts)
-            elif step.tool:
-                tool_name = step.tool.name
-                if tool_name != "final_answer":
-                    yield trajectory.trajectory_metadata(
-                        title=f"{tool_name} (request)",
-                        content=summarize_for_trajectory(step.input),
-                    )
-
-                    if getattr(step, "error", None):
-                        yield trajectory.trajectory_metadata(
-                            title=f"{tool_name} (error)",
-                            content=step.error.explain(),
-                        )
-                    else:
-                        output_text = (
-                            step.output.get_text_content() if getattr(step, "output", None) else "No output"
-                        )
-                        yield trajectory.trajectory_metadata(
-                            title=f"{tool_name} (response)",
-                            content=summarize_for_trajectory(output_text),
-                        )
-
-    # Persist the final response in conversation history
-    await context.store(AgentMessage(text=response_text))
-
-# Start the server and run the agent
 def run() -> None:
-    """Start the AgentStack server for the healthcare concierge."""
-    host = os.getenv("HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", 8000))
-    server.run(host=host, port=port)
+    server.run(
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", 8000)),
+    )
 
 
 if __name__ == "__main__":
