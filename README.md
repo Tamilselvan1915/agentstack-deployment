@@ -1,91 +1,104 @@
 # Healthcare Multi-Agent System — AgentStack Deployment
 
-Four agents packaged for the AgentStack platform, following the A2A protocol.
+Four agents deployed on the AgentStack platform using BeeAI framework and A2A protocol.
+
+## Overview
+
+This system demonstrates a multi-agent healthcare concierge built on AgentStack:
+
+1. **HealthcareAgent** — Orchestrator using BeeAI `RequirementAgent` + `HandoffTool`. Routes questions to sub-agents discovered automatically on the platform.
+2. **PolicyAgent** — Reads the Anthem 2026 benefits PDF and answers insurance coverage questions using the platform LLM.
+3. **ProviderAgent** — Finds in-network doctors by city/state via LangChain + MCP tool backed by a JSON provider database.
+4. **ResearchAgent** — Searches the web via Serper API (Google search) to answer health condition and treatment questions.
 
 ## Folder Structure
 
 ```
 agentstack-healthcare/
-├── policy_agent/          # Insurance coverage Q&A (reads Anthem PDF)
+├── policy_agent/
 │   ├── Dockerfile
 │   ├── pyproject.toml
+│   ├── uv.lock
 │   └── agentstack_agents/
 │       ├── __init__.py
-│       └── policy_agent.py
-│       └── 2026AnthemgHIPSBC.pdf  ← copy here (see step 1)
-├── research_agent/        # Healthcare Q&A using Claude
+│       ├── policy_agent.py
+│       └── 2026AnthemgHIPSBC.pdf
+├── research_agent/
 │   ├── Dockerfile
 │   ├── pyproject.toml
+│   ├── uv.lock
 │   └── agentstack_agents/
 │       ├── __init__.py
-│       └── research_agent.py
-├── provider_agent/        # Find doctors via LangChain + MCP
+│       ├── research_agent.py
+│       └── streaming_citation_parser.py
+├── provider_agent/
 │   ├── Dockerfile
 │   ├── pyproject.toml
+│   ├── uv.lock
 │   └── agentstack_agents/
 │       ├── __init__.py
 │       ├── provider_agent.py
 │       ├── mcpserver.py
-│       └── doctors.json   ← copy here (see step 1)
-└── healthcare_agent/      # Orchestrator (calls policy + provider in parallel)
+│       └── doctors.json
+└── healthcare_agent/
     ├── Dockerfile
     ├── pyproject.toml
+    ├── uv.lock
     └── agentstack_agents/
         ├── __init__.py
         └── healthcare_agent.py
 ```
 
-## Setup Steps
+## Setup
 
-### 1. Copy data files
+### 1. Deploy to AgentStack using the CLI
 
-```
-copy ..\Data\2026AnthemgHIPSBC.pdf  policy_agent\agentstack_agents\
-copy ..\Data\doctors.json            provider_agent\agentstack_agents\
-```
+Install the AgentStack CLI and add each agent from your repository:
 
-### 2. Generate uv lock files (requires [uv](https://docs.astral.sh/uv/))
-
-Run in each agent folder before building Docker images:
-
-```
-cd policy_agent   && uv lock && cd ..
-cd research_agent && uv lock && cd ..
-cd provider_agent && uv lock && cd ..
-cd healthcare_agent && uv lock && cd ..
+```bash
+agentstack add https://github.com/Tamilselvan1915/agentstack-deployment@main#path=/policy_agent
+agentstack add https://github.com/Tamilselvan1915/agentstack-deployment@main#path=/research_agent
+agentstack add https://github.com/Tamilselvan1915/agentstack-deployment@main#path=/provider_agent
+agentstack add https://github.com/Tamilselvan1915/agentstack-deployment@main#path=/healthcare_agent
 ```
 
-### 3. Build Docker images
+### 2. Configure LLM extensions
 
-```
-docker build -t policy-agent    ./policy_agent
-docker build -t research-agent  ./research_agent
-docker build -t provider-agent  ./provider_agent
-docker build -t healthcare-agent ./healthcare_agent
-```
+Each agent uses the AgentStack **LLM Service Extension** — no API keys hardcoded in the agent. Configure a Gemini (or other) LLM key on the AgentStack platform for each agent.
 
-### 4. Deploy on AgentStack
+Suggested model: `gemini:gemini-2.5-flash-lite`
 
-Push each image to your container registry and deploy as separate agents.
+### 3. Configure environment variables
 
-#### Required environment variables per agent
+| Agent          | Variable        | Description                      |
+|----------------|-----------------|----------------------------------|
+| ResearchAgent  | SERPER_API_KEY  | Serper API key for Google search |
 
-| Agent             | Env Var              | Value                          |
-|-------------------|----------------------|--------------------------------|
-| policy_agent      | ANTHROPIC_API_KEY    | your Anthropic API key         |
-| research_agent    | ANTHROPIC_API_KEY    | your Anthropic API key         |
-| provider_agent    | ANTHROPIC_API_KEY    | your Anthropic API key         |
-| healthcare_agent  | ANTHROPIC_API_KEY    | your Anthropic API key         |
-| healthcare_agent  | POLICY_AGENT_URL     | deployed URL of PolicyAgent    |
-| healthcare_agent  | PROVIDER_AGENT_URL   | deployed URL of ProviderAgent  |
+Get a free Serper API key at [serper.dev](https://serper.dev).
 
-### 5. Agent names on AgentStack platform
+All other credentials are provided via the AgentStack LLM extension — no `ANTHROPIC_API_KEY` needed.
 
-| Agent             | Name registered       |
-|-------------------|-----------------------|
-| policy_agent      | PolicyAgent           |
-| research_agent    | ResearchAgent         |
-| provider_agent    | ProviderAgent         |
-| healthcare_agent  | HealthcareAgent       |
+### 4. Deploy order
 
-Deploy order: policy, research, provider first — then healthcare (needs their URLs).
+Deploy **PolicyAgent**, **ResearchAgent**, and **ProviderAgent** first.
+Then deploy **HealthcareAgent** — it auto-discovers the others via `AgentStackAgent.from_agent_stack()`.
+
+## Sample Queries
+
+**HealthcareAgent:**
+> "I need mental health assistance in Austin, Texas — who can I see and what's covered?"
+
+**PolicyAgent:**
+> "What is my coinsurance for office visits in-network versus out-of-network?"
+
+**ProviderAgent:**
+> "What dermatologists practice in Los Angeles?"
+
+**ResearchAgent:**
+> "What are the symptoms and treatment options for Type 2 diabetes?"
+
+## Architecture
+
+The **HealthcareAgent** uses BeeAI's `RequirementAgent` with `HandoffTool` to delegate questions to specialized agents discovered on the AgentStack platform. It enforces that all three sub-agents are consulted before returning a final answer.
+
+The LLM for all agents is provided dynamically by the AgentStack platform — no vendor lock-in.
