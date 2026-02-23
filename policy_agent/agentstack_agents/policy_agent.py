@@ -15,6 +15,9 @@ from agentstack_sdk.a2a.types import AgentMessage
 from agentstack_sdk.server import Server
 from agentstack_sdk.server.context import RunContext
 from anthropic import Anthropic
+from dotenv import load_dotenv
+
+load_dotenv()
 
 server = Server()
 
@@ -27,7 +30,7 @@ async def policy_agent(input: Message, context: RunContext):
     """Answers insurance policy coverage questions using the Anthem benefits PDF."""
     prompt = get_message_text(input)
 
-    client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    client = Anthropic()
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1024,

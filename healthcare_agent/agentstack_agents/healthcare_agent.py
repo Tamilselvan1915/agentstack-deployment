@@ -9,34 +9,53 @@ Deployed on AgentStack. Required env vars:
 """
 import asyncio
 import os
+import uuid
 
 import httpx
-from a2a.client import Client, ClientConfig, ClientFactory, create_text_message_object
-from a2a.types import Artifact, Message, Task
+from a2a.types import Message
 from a2a.utils.message import get_message_text
 from agentstack_sdk.a2a.types import AgentMessage
 from agentstack_sdk.server import Server
 from agentstack_sdk.server.context import RunContext
 from anthropic import Anthropic
+from dotenv import load_dotenv
+
+load_dotenv()
 
 server = Server()
 
 
 async def _call_agent(url: str, query: str) -> str:
-    """Call an A2A sub-agent and return its text response."""
-    async with httpx.AsyncClient(timeout=60.0) as httpx_client:
-        client: Client = await ClientFactory.connect(
-            url, client_config=ClientConfig(httpx_client=httpx_client)
-        )
-        message = create_text_message_object(content=query)
-        async for response in client.send_message(message):
-            if isinstance(response, Message):
-                return get_message_text(response)
-            elif isinstance(response, tuple):
-                task: Task = response[0]
-                if task.artifacts:
-                    artifact: Artifact = task.artifacts[0]
-                    return get_message_text(artifact)
+    """Call an A2A sub-agent via JSON-RPC and return its text response."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "message/send",
+        "params": {
+            "message": {
+                "messageId": str(uuid.uuid4()),
+                "role": "user",
+                "parts": [{"kind": "text", "text": query}],
+            }
+        },
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(f"{url.rstrip('/')}/jsonrpc/", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    result = data.get("result", {})
+    # AgentStack history format
+    for msg in reversed(result.get("history", [])):
+        if msg.get("role") == "agent":
+            for part in msg.get("parts", []):
+                if part.get("kind") == "text":
+                    return part["text"]
+    # Fallback: artifacts format
+    for artifact in result.get("artifacts", []):
+        for part in artifact.get("parts", []):
+            if part.get("kind") == "text":
+                return part["text"]
     return "(no response)"
 
 
@@ -48,8 +67,8 @@ async def healthcare_agent(input: Message, context: RunContext):
     """
     query = get_message_text(input)
 
-    policy_url = os.environ.get("POLICY_AGENT_URL", "http://localhost:9999")
-    provider_url = os.environ.get("PROVIDER_AGENT_URL", "http://localhost:9997")
+    policy_url = os.environ.get("POLICY_AGENT_URL", "http://localhost:8001")
+    provider_url = os.environ.get("PROVIDER_AGENT_URL", "http://localhost:8002")
 
     # Call both sub-agents concurrently
     policy_resp, provider_resp = await asyncio.gather(
@@ -58,7 +77,7 @@ async def healthcare_agent(input: Message, context: RunContext):
     )
 
     # Combine with a lean Anthropic call
-    anthropic = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    anthropic = Anthropic()
     result = anthropic.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=512,
