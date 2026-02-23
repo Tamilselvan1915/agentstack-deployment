@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "healthcare_agent"
+version = "0.1.0"
+description = "Healthcare orchestrator - calls policy and provider sub-agents via A2A"
+requires-python = ">=3.13"
+dependencies = [
+    "agentstack-sdk>=0.4.3",
+    "anthropic>=0.49.0",
+    "httpx>=0.27.0",
+    "a2a>=0.3.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+server = "agentstack_agents.healthcare_agent:run"
+
+[tool.uv]
+package = true
+
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agentstack_agents*"]

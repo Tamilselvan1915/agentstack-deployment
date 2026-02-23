@@ -1,0 +1,44 @@
+"""
+Research Agent — answers healthcare questions (symptoms, conditions, treatments).
+Deployed on AgentStack. Requires ANTHROPIC_API_KEY env var.
+"""
+import os
+
+from a2a.types import Message
+from a2a.utils.message import get_message_text
+from agentstack_sdk.a2a.types import AgentMessage
+from agentstack_sdk.server import Server
+from agentstack_sdk.server.context import RunContext
+from anthropic import Anthropic
+
+server = Server()
+
+
+@server.agent(name="ResearchAgent")
+async def research_agent(input: Message, context: RunContext):
+    """Answers questions about health conditions, symptoms, treatments, and procedures."""
+    prompt = get_message_text(input)
+
+    client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        system=(
+            "You are a healthcare research expert. Answer questions about health conditions, "
+            "symptoms, treatments, and medical procedures. Be accurate and concise (2-5 lines). "
+            "Always recommend consulting a doctor for personal medical advice."
+        ),
+        messages=[{"role": "user", "content": prompt}],
+    )
+    yield AgentMessage(text=response.content[0].text)
+
+
+def run() -> None:
+    server.run(
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", 8000)),
+    )
+
+
+if __name__ == "__main__":
+    run()
